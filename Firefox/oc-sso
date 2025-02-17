@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+# pylint: disable=C0103,C0114,C0115,C0116,E1121,R0902,R0903
+import argparse
+import json
+import logging as log
+import os
+from shutil import rmtree
+import socket
+from subprocess import CalledProcessError, DEVNULL, Popen, run
+import sys
+from tempfile import mkdtemp
+from time import sleep
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from xml.etree import ElementTree as ET
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=os.path.basename(__file__),
+        description='Wrapper script for OpenConnect implementing SAML 2.0 '
+                    'web-browser authentication to Cisco SSL VPNs',
+        epilog='All additional options are passed to OpenConnect',
+        allow_abbrev=False)
+    parser.add_argument(
+        '-V', '--version', action='version', version='%(prog)s v0.1-ff')
+    parser.add_argument(
+        '-L', '--log-level', metavar='LEVEL',
+        choices=['ERROR', 'WARNING', 'INFO', 'DEBUG'], default='INFO',
+        help='verbosity level for logging messages '
+             '(%(choices)s; default: %(default)s)')
+    parser.add_argument(
+        '--version-string', dest='version', default='5.1.4.74',
+        help='AnyConnect version for authentication and OpenConnect '
+             '(default:  %(default)s)')
+    parser.add_argument(
+        '--sso-timeout', type=int, default='120',
+        help='timeout in seconds for web-browser SSO authentication '
+             '(default: %(default)s)')
+    parser.add_argument(
+        '--attempts', type=int, default='5',
+        help='number of attempts to create the VPN connection after '
+             'authentication (default: %(default)s)')
+    parser.add_argument(
+        'server',
+        help='VPN server hostname')
+    args, oc_args = parser.parse_known_args()
+
+    log.basicConfig(format='%(levelname)s: %(message)s', level=args.log_level)
+
+    try:
+        vpn_url = 'https://' + args.server
+        log.info('Authenticating to VPN endpoint %r', vpn_url)
+        vpn_url, auth_info = authenticate(vpn_url, args)
+    except KeyboardInterrupt:
+        log.warning('Exiting on SIGINT')
+        return os.EX_TEMPFAIL
+    except HTTPError as e:
+        log.error('Request error: %r', e)
+        return os.EX_PROTOCOL
+    except AuthResponseError as e:
+        log.error('Required attributes not found in response (%r), '
+                  'does this endpoint do SSO?), exiting', e)
+        return os.EX_DATAERR
+    except BrowserException as e:
+        log.error('Error in web-browser session: %r', e)
+        return os.EX_UNAVAILABLE
+    except Exception as e:
+        log.error(e)
+        return os.EX_SOFTWARE
+
+    try:
+        command = [
+            'sudo', 'openconnect',
+            '--useragent', f'AnyConnect Linux_64 {args.version}',
+            '--version-string', args.version,
+            '--cookie-on-stdin',
+            # '--servercert', auth_info.server_cert_hash,
+            *oc_args,
+            vpn_url
+        ]
+        session_token = auth_info.session_token.encode('UTF-8')
+        log.debug('Starting OpenConnect: %r', command)
+        for attempt in range(args.attempts):
+            try:
+                run(command, input=session_token, check=True)
+                break
+            except CalledProcessError as e:
+                log.debug('OpenConnect exited with code %r', e.returncode)
+                log.info('Attempt %d in 5 seconds...', attempt + 2)
+                sleep(5)
+
+    except KeyboardInterrupt:
+        log.warning('Exiting on SIGINT')
+
+    return os.EX_OK
+
+
+def authenticate(vpn_url, args):
+    # Resolve possible redirect
+    vpn_url = urlopen(vpn_url).url
+    log.debug('Auth target URL %r', vpn_url)
+
+    # as sent by Secure Client
+    headers = {
+        'User-Agent': f'AnyConnect Linux_64 {args.version}',
+        'Accept': '*/*',
+        'Accept-Encoding': 'identity',
+        'X-Transcend-Version': '1',
+        'X-Aggregate-Auth': '1',
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+
+    # Start authentication
+    request = AuthInitRequest(args.version, vpn_url).str()
+    log.debug('Sending auth init request: %r', request)
+    response = urlopen(Request(vpn_url, request, headers)).read()
+    log.debug('Auth init response received: %r', response)
+    auth_info = parse_response(response)
+    if not isinstance(auth_info, AuthRequestResponse):
+        log.error('Could not start authentication. '
+                  'Invalid response type in current state: %r', auth_info)
+        raise AuthenticationError(auth_info)
+    if auth_info.error:
+        log.error('Could not start authentication. Error %r in response: %r',
+                  auth_info.error, auth_info)
+        raise AuthenticationError(auth_info)
+
+    # SSO authentication in web browser
+    try:
+        log.debug('Launching web browser at %r', auth_info.login)
+        with Firefox() as browser:
+            browser.NavigateTo(auth_info.login)
+            sleep(1)
+            url = browser.GetCurrentURL()
+            log.debug('Current URL: %r', url)
+            if url == auth_info.login:
+                raise AuthenticationError('Not redirected to login page')
+            browser.ExecuteScript('document.title="OpenConnect authentication '
+                                  f'to {args.server}"')
+            log.debug('Waiting for cookie %r', auth_info.cookie)
+            sso_token = browser.GetNamedCookie(auth_info.cookie,
+                                               args.sso_timeout)
+            log.debug('SSO token: %r', sso_token)
+    except BrokenPipeError:
+        raise BrowserException('Browser was closed')
+    except Exception as e:
+        raise BrowserException(e) from e
+    if not sso_token:
+        raise AuthResponseError('Did not receive SSO token in '
+                                f'{args.sso_timeout} seconds')
+
+    # Complete authentication
+    request = AuthFinishRequest(args.version, auth_info, sso_token).str()
+    log.debug('Sending auth finish request: %r', request)
+    response = urlopen(Request(vpn_url, request, headers)).read()
+    log.debug('Auth finish response received: %r', response)
+    auth_info = parse_response(response)
+    if not isinstance(auth_info, AuthCompleteResponse):
+        log.error('Could not finish authentication. '
+                  'Invalid response type in current state: %r', auth_info)
+        raise AuthenticationError(auth_info)
+    log.debug('Session token: %r', auth_info.session_token)
+
+    return vpn_url, auth_info
+
+
+class AuthRequest:
+    SE = ET.SubElement
+
+    def __init__(self, t, version):
+        self.xml = ET.Element('config-auth',
+                              {'client': 'vpn',
+                               'type': t,
+                               'aggregate-auth-version': '2'})
+        self.SE(self.xml, 'version', {'who': 'vpn'}).text = version
+        self.SE(self.xml, 'device-id').text = 'linux-64'
+
+    def str(self):
+        ET.indent(self.xml)
+        return ET.tostring(self.xml, xml_declaration=True,
+                           encoding='UTF-8') + b'\n'
+
+
+class AuthInitRequest(AuthRequest):
+    def __init__(self, version, vpn_url):
+        super().__init__('init', version)
+        self.SE(self.xml, 'group-select').text = ''
+        self.SE(self.xml, 'group-access').text = vpn_url
+        self.SE(self.SE(self.xml, 'capabilities'),
+                'auth-method').text = 'single-sign-on-v2'
+
+
+class AuthFinishRequest(AuthRequest):
+    def __init__(self, version, auth_info, sso_token):
+        super().__init__('auth-reply', version)
+        self.SE(self.xml, 'session-token')
+        self.SE(self.xml, 'session-id')
+        self.xml.append(auth_info.opaque)
+        self.SE(self.SE(self.xml, 'auth'), 'sso-token').text = sso_token
+
+
+def parse_response(response):
+    xml = ET.fromstring(response)
+    t = xml.get('type')
+    if t == 'auth-request':
+        resp = AuthRequestResponse(xml)
+        exp_id = 'main'
+    elif t == 'complete':
+        resp = AuthCompleteResponse(xml)
+        exp_id = 'success'
+    log.info('Response received: id=%r, message=%r%s', resp.id, resp.message,
+             f', title={resp.title!r}' if hasattr(resp, 'title') else '')
+    assert resp.id == exp_id
+    return resp
+
+
+class AuthResponse:
+    def val(self, path):
+        return self.xml.find(path).text
+
+    def opt(self, path):
+        return getattr(self.xml.find(path), 'text', None)
+
+    def __repr__(self):
+        return type(self).__name__ + str(vars(self))
+
+
+class AuthRequestResponse(AuthResponse):
+    def __init__(self, xml):
+        self.xml = xml
+        try:
+            self.id = xml.find('auth').get('id')
+            self.title = self.opt('auth/title')
+            self.message = self.val('auth/message')
+            self.error = self.opt('auth/error')
+            self.opaque = xml.find('opaque')
+            self.login = self.val('auth/sso-v2-login')
+            # self.final = self.val('auth/sso-v2-login-final')
+            self.cookie = self.val('auth/sso-v2-token-cookie-name')
+        except AttributeError as e:
+            raise AuthResponseError(self.opt('error') or e)
+        del self.xml
+
+
+class AuthCompleteResponse(AuthResponse):
+    def __init__(self, xml):
+        self.xml = xml
+        try:
+            self.id = xml.find('auth').get('id')
+            self.message = self.val('auth/message')
+            self.session_token = self.val('session-token')
+            # self.server_cert_hash = \
+            #     self.val('config/vpn-base-config/server-cert-hash')
+        except AttributeError as e:
+            raise AuthResponseError(self.opt('error') or e)
+        del self.xml
+
+
+class AuthenticationError(Exception):
+    pass
+
+
+class AuthResponseError(AuthenticationError):
+    pass
+
+
+class Firefox:
+    def __init__(self):
+        self.msg_id = 0
+
+    def __enter__(self):
+        self.NewSession()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.DeleteSession()
+
+    def command(self, method, data=None, quiet=(False, False)):
+        self.msg_id += 1
+        if not quiet[0]:
+            log.debug('Marionette command: %s %r', method, data or '')
+        msg = json.dumps([0, self.msg_id, method, data]).encode()
+        msg = str(len(msg)).encode() + b':' + msg
+        self.socket.sendall(msg)
+        resp = self.socket.recv(10000)
+        if not quiet[1]:
+            log.debug('Response: %r', resp)
+        # discard response length and parse
+        resp = json.loads(resp[resp.find(b':')+1:])
+        error = resp[2]
+        if error:
+            raise BrowserException(error)
+        return resp[3]
+
+    def DeleteSession(self):
+        self.command('Marionette:Quit')
+        sleep(1)
+        log.debug('Deleting temporary Firefox profile %r', self.profile)
+        rmtree(self.profile, ignore_errors=True)
+
+    def ExecuteScript(self, script):
+        self.command('WebDriver:ExecuteScript', {'script': script})
+
+    def GetCurrentURL(self):
+        return self.command('WebDriver:GetCurrentURL')['value']
+
+    def GetNamedCookie(self, name, timeout=1):
+        for t in range(timeout):
+            cookies = self.command('WebDriver:GetCookies', quiet=(t, True))
+            for c in cookies:
+                if c['name'] == name:
+                    log.debug('Response: ... %r ...', c)
+                    return c['value']
+            sleep(1)  # (ignoring small time spent in command() and search)
+        log.debug('Response: no such cookie')
+        return None
+
+    def NavigateTo(self, url):
+        self.command('WebDriver:Navigate', {'url': url})
+
+    def NewSession(self):
+        # get random available port
+        with socket.create_server(('127.0.0.1', 0)) as s:
+            addr, port = s.getsockname()
+        # start browser (on hopefully still available port), discarding logging
+        os.umask(0o077)
+        self.profile = mkdtemp(prefix='ff-sso-')
+        log.debug('Using temporary Firefox profile %r', self.profile)
+        with open(self.profile + '/prefs.js', 'w', encoding='ascii') as f:
+            f.write(f'user_pref("marionette.port", {port});\n')
+        log.debug('Starting Firefox with Marionette port %d', port)
+        if log.getLogger(__name__).isEnabledFor(log.DEBUG):
+            stderr = None
+        else:
+            stderr = DEVNULL
+        Popen(['firefox', 'about:blank', '--marionette', '--no-remote',
+               '-profile', self.profile],
+              stdout=DEVNULL, stderr=stderr)
+        # Marionette connection
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.settimeout(10.0)
+        for _ in range(10):
+            try:
+                self.socket.connect((addr, port))
+                resp = self.socket.recv(1000)
+                log.debug('Response: %r', resp)
+                break
+            except ConnectionError:
+                log.debug('Waiting for Firefox...')
+                sleep(1)
+        else:
+            raise ConnectionError('Could not connect to Firefox')
+        self.command('WebDriver:NewSession')
+
+
+class BrowserException(Exception):
+    pass
+
+
+if __name__ == '__main__':
+    sys.exit(main())
