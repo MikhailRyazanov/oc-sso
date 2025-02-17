@@ -16,7 +16,7 @@ This is a minimalistic rewrite of [openconnect-sso](https://github.com/vlaci/ope
 Only basic functionality is implemented.
 - Intended only for Linux. Might work in other Unix-like systems but unlikely in Windows.
 - No configuration files. If needed, make a shell wrapper passing the necessary command-line options.
-- Groups are not supported. Only because I can’t test them.
+- Groups and proxies are not supported. Only because I can’t test them.
 - No automatic login. Should be doable like in `openconnect-sso` but is out of scope.
 
 
