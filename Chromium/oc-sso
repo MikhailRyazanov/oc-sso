@@ -330,7 +330,7 @@ class Chrome:
             stderr = None
         else:
             stderr = DEVNULL
-        Popen(['chromium', '--temp-profile', '--no-first-run',
+        Popen(['chromium', '--temp-profile', '--no-first-run', '--guest',
                f'--remote-debugging-port={port}',
                f'--remote-allow-origins={url}',
                'about:blank'],
