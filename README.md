@@ -54,6 +54,8 @@ A clean temporary browser profile is used every time. This means that your brows
 
 The original `openconnect-sso` is passing `--servercert` from the last authentication response to `openconnect`, but here this code is commented out as useless: everything is done through HTTPS anyway, and if you worry about spoofing, then certificates must be checked at *every* step instead of sending your credentials to an unconfirmed server and trusting the fingerprint received from it.
 
+“OpenConnect needs to be run as the root user in order to make changes to the system networking configuration”, so it is launched using `sudo`, which will ask for your local password. If you want to allow this without requiring the password, add `NOPASSWD: /usr/sbin/openconnect` to your user in [sudoers](https://man7.org/linux/man-pages/man5/sudoers.5.html#SUDOERS_FILE_FORMAT) (as a precaution, this permission can be limited to executing `openconnect` only with specific command-line arguments, which can be found by running `oc-sso` with `--log-level DEBUG`). Alternatively, see [“Running as non-root user”](https://www.infradead.org/openconnect/nonroot.html) in the OpenConnect documentation and modify the script accordingly (specifically, the `'sudo', 'openconnect',` line).
+
 
 ## Bugs and suggestions
 
