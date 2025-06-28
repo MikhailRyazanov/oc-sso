@@ -23,7 +23,7 @@ def main():
         epilog='All additional options are passed to OpenConnect',
         allow_abbrev=False)
     parser.add_argument(
-        '-V', '--version', action='version', version='%(prog)s v0.1-ch')
+        '-V', '--version', action='version', version='%(prog)s v0.2-ch')
     parser.add_argument(
         '-L', '--log-level', metavar='LEVEL',
         choices=['ERROR', 'WARNING', 'INFO', 'DEBUG'], default='INFO',
@@ -39,8 +39,8 @@ def main():
              '(default: %(default)s)')
     parser.add_argument(
         '--attempts', type=int, default='5',
-        help='number of attempts to create the VPN connection after '
-             'authentication (default: %(default)s)')
+        help='number of attempts to communicate with the server at the stages '
+             'that can fail randomly (default: %(default)s)')
     parser.add_argument(
         'server',
         help='VPN server hostname')
@@ -86,7 +86,7 @@ def main():
                 run(command, input=session_token, check=True)
                 break
             except CalledProcessError as e:
-                log.debug('OpenConnect exited with code %r', e.returncode)
+                log.warning('OpenConnect exited with code %r', e.returncode)
                 log.info('Attempt %d in 5 seconds...', attempt + 2)
                 sleep(5)
 
@@ -112,30 +112,44 @@ def authenticate(vpn_url, args):
     }
 
     # Start authentication
-    request = AuthInitRequest(args.version, vpn_url).str()
-    log.debug('Sending auth init request: %r', request)
-    response = urlopen(Request(vpn_url, request, headers)).read()
-    log.debug('Auth init response received: %r', response)
-    auth_info = parse_response(response)
-    if not isinstance(auth_info, AuthRequestResponse):
-        log.error('Could not start authentication. '
-                  'Invalid response type in current state: %r', auth_info)
-        raise AuthenticationError(auth_info)
-    if auth_info.error:
-        log.error('Could not start authentication. Error %r in response: %r',
-                  auth_info.error, auth_info)
-        raise AuthenticationError(auth_info)
+    def auth_init():
+        request = AuthInitRequest(args.version, vpn_url).str()
+        log.debug('Sending auth init request: %r', request)
+        response = urlopen(Request(vpn_url, request, headers)).read()
+        log.debug('Auth init response received: %r', response)
+        auth_info = parse_response(response)
+        if not isinstance(auth_info, AuthRequestResponse):
+            log.error('Could not start authentication. '
+                      'Invalid response type in current state: %r', auth_info)
+            raise AuthenticationError(auth_info)
+        if auth_info.error:
+            log.error('Could not start authentication. '
+                      'Error %r in response: %r', auth_info.error, auth_info)
+            raise AuthenticationError(auth_info)
+        return auth_info
+
+    auth_info = auth_init()
 
     # SSO authentication in web browser
     try:
         log.debug('Launching web browser at %r', auth_info.login)
         with Chrome() as browser:
-            browser.NavigateTo(auth_info.login)
-            sleep(1)
-            url = browser.GetCurrentURL()
-            log.debug('Current URL: %r', url)
-            if url == auth_info.login:
-                raise AuthenticationError('Not redirected to login page')
+            for attempt in range(1, args.attempts):
+                browser.NavigateTo(auth_info.login)
+                sleep(1)
+                url = browser.GetCurrentURL()
+                log.debug('Current URL: %r', url)
+                if url != auth_info.login:
+                    break
+                log.warning('Not redirected to login page')
+                if attempt < args.attempts - 1:
+                    log.info('Attempt %d...', attempt + 1)
+                    auth_info = auth_init()
+                    log.debug('Trying %r', auth_info.login)
+                    sleep(1)
+            else:
+                raise AuthenticationError(
+                    'Browser was not redirected to login page')
             browser.ExecuteScript('document.title="OpenConnect authentication '
                                   f'to {args.server}"')
             log.debug('Waiting for cookie %r', auth_info.cookie)
@@ -152,13 +166,22 @@ def authenticate(vpn_url, args):
 
     # Complete authentication
     request = AuthFinishRequest(args.version, auth_info, sso_token).str()
-    log.debug('Sending auth finish request: %r', request)
-    response = urlopen(Request(vpn_url, request, headers)).read()
-    log.debug('Auth finish response received: %r', response)
-    auth_info = parse_response(response)
-    if not isinstance(auth_info, AuthCompleteResponse):
-        log.error('Could not finish authentication. '
-                  'Invalid response type in current state: %r', auth_info)
+    for attempt in range(args.attempts):
+        log.debug('Sending auth finish request: %r', request)
+        response = urlopen(Request(vpn_url, request, headers)).read()
+        log.debug('Auth finish response received: %r', response)
+        try:
+            auth_info = parse_response(response)
+        except AuthResponseError:
+            auth_info = None
+        if not isinstance(auth_info, AuthCompleteResponse):
+            log.warning('Invalid response type in current state: %r',
+                        auth_info)
+            sleep(1)
+        else:
+            break
+    else:
+        log.error('Could not finish authentication.')
         raise AuthenticationError(auth_info)
     log.debug('Session token: %r', auth_info.session_token)
 
@@ -340,7 +363,7 @@ class Chrome:
                 resp = json.loads(urlopen(f'{url}/json').read())
                 self.ws = websocket.create_connection(
                     resp[0]['webSocketDebuggerUrl'])
-                self.ws.settimeout(1)
+                self.ws.settimeout(10)
                 break
             except URLError:
                 log.debug('Waiting for Chromium...')
