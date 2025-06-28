@@ -36,7 +36,7 @@ Simply download the desired variant in a directory from which it can be executed
   --attempts ATTEMPTS   number of attempts to communicate with the server at
                         the stages that can fail randomly (default: 5)
 ```
-(The last one is needed because the server sometimes fails to redirect to the actual login page or to accept correct authorization responses immediately, but does so after repeated attempts; see “[Bugs](#bugs-and suggestions)” below.)
+(The last one is needed because the server sometimes fails to redirect to the actual login page or to accept correct authorization responses immediately, but does so after repeated attempts; see “[Bugs](#bugs-and-suggestions)” below.)
 
 The WebDriver variant has an additional option to select which driver (and thus browser) to use:
 ```
